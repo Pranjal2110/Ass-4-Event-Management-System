@@ -1,6 +1,8 @@
 import express from "express";
 import {
   getAllEvents,
+  getVenues,
+  getCategories,
   getEventById,
   createEvent,
   updateEvent,
@@ -17,6 +19,8 @@ const router = express.Router();
 
 // Public routes
 router.get("/", getAllEvents);
+router.get("/venues", getVenues);
+router.get("/categories", getCategories);
 
 // Authenticated user registrations (Must come before /:id)
 router.get("/my-registrations", authenticateUser, getMyRegistrations);
