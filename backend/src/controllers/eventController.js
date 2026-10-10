@@ -1,27 +1,62 @@
 import mongoose from "mongoose";
 import Event from "../models/Event.js";
 
-// GET all events with optional search/filter
+// Helper to escape regex special characters to prevent ReDoS / syntax errors
+const escapeRegex = (text) => text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+
+// GET all events with enhanced search, venue, category, and date filters
 export const getAllEvents = async (req, res) => {
   try {
-    const { search, venue } = req.query;
+    const { search, venue, category, status, upcomingOnly, sortBy } = req.query;
     const filter = {};
 
-    if (search) {
+    // Multi-field search filter (title, description, organizer, venue, category)
+    if (search && search.trim() !== "") {
+      const sanitized = escapeRegex(search.trim());
       filter.$or = [
-        { title: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } },
-        { organizer: { $regex: search, $options: "i" } },
+        { title: { $regex: sanitized, $options: "i" } },
+        { description: { $regex: sanitized, $options: "i" } },
+        { organizer: { $regex: sanitized, $options: "i" } },
+        { venue: { $regex: sanitized, $options: "i" } },
+        { category: { $regex: sanitized, $options: "i" } },
       ];
     }
 
-    if (venue) {
-      filter.venue = { $regex: venue, $options: "i" };
+    // Venue filter (case-insensitive)
+    if (venue && venue.trim() !== "") {
+      filter.venue = { $regex: escapeRegex(venue.trim()), $options: "i" };
+    }
+
+    // Category filter
+    if (category && category.trim() !== "") {
+      filter.category = category.trim();
+    }
+
+    // Status filter
+    if (status && status.trim() !== "") {
+      filter.status = status.trim();
+    }
+
+    // Optional filter for only upcoming events
+    if (upcomingOnly === "true") {
+      filter.date = { $gte: new Date() };
+    }
+
+    // Dynamic sorting
+    let sortOption = { date: 1 }; // Default: earliest upcoming event first
+    if (sortBy === "date_desc") {
+      sortOption = { date: -1 };
+    } else if (sortBy === "title_asc") {
+      sortOption = { title: 1 };
+    } else if (sortBy === "capacity_desc") {
+      sortOption = { capacity: -1 };
+    } else if (sortBy === "capacity_asc") {
+      sortOption = { capacity: 1 };
     }
 
     const events = await Event.find(filter)
       .populate("registeredUsers", "name email")
-      .sort({ date: 1 });
+      .sort(sortOption);
 
     res.json(events);
   } catch (error) {
@@ -29,11 +64,40 @@ export const getAllEvents = async (req, res) => {
   }
 };
 
+// GET distinct list of venues (useful for UI venue dropdown filters)
+export const getVenues = async (req, res) => {
+  try {
+    const venues = await Event.distinct("venue");
+    const cleanedVenues = venues.filter((v) => v && v.trim() !== "").sort();
+    res.json(cleanedVenues);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch venues", error: error.message });
+  }
+};
+
+// GET supported event categories
+export const getCategories = async (req, res) => {
+  try {
+    const categories = [
+      "Technical",
+      "Cultural",
+      "Workshop",
+      "Hackathon",
+      "Seminar",
+      "Sports",
+      "Other",
+    ];
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch categories", error: error.message });
+  }
+};
+
 // GET a single event by ID
 export const getEventById = async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ message: "Invalid event ID" });
+      return res.status(400).json({ message: "Invalid event ID format" });
     }
 
     const event = await Event.findById(req.params.id).populate(
@@ -54,19 +118,31 @@ export const getEventById = async (req, res) => {
 // CREATE a new event (Admin only)
 export const createEvent = async (req, res) => {
   try {
-    const { title, description, date, venue, organizer, capacity } = req.body;
+    const { title, description, date, venue, organizer, capacity, category, price } = req.body;
 
     if (!title || !description || !date || !venue || !organizer || !capacity) {
-      return res.status(400).json({ message: "All fields are required" });
+      return res.status(400).json({ message: "All required fields must be provided" });
+    }
+
+    const numericCapacity = Number(capacity);
+    if (isNaN(numericCapacity) || numericCapacity <= 0) {
+      return res.status(400).json({ message: "Capacity must be a positive integer" });
+    }
+
+    const parsedDate = new Date(date);
+    if (isNaN(parsedDate.getTime())) {
+      return res.status(400).json({ message: "Invalid event date format" });
     }
 
     const event = await Event.create({
-      title,
-      description,
-      date,
-      venue,
-      organizer,
-      capacity: Number(capacity),
+      title: title.trim(),
+      description: description.trim(),
+      date: parsedDate,
+      venue: venue.trim(),
+      organizer: organizer.trim(),
+      capacity: numericCapacity,
+      category: category ? category.trim() : "Technical",
+      price: price !== undefined ? Math.max(0, Number(price)) : 0,
       registeredUsers: [],
     });
 
@@ -80,19 +156,33 @@ export const createEvent = async (req, res) => {
 export const updateEvent = async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ message: "Invalid event ID" });
+      return res.status(400).json({ message: "Invalid event ID format" });
     }
 
-    const event = await Event.findByIdAndUpdate(req.params.id, req.body, {
+    const currentEvent = await Event.findById(req.params.id);
+    if (!currentEvent) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Safety check: new capacity cannot be lower than existing registered users
+    if (req.body.capacity !== undefined) {
+      const newCapacity = Number(req.body.capacity);
+      if (isNaN(newCapacity) || newCapacity <= 0) {
+        return res.status(400).json({ message: "Capacity must be a positive integer" });
+      }
+      if (newCapacity < currentEvent.registeredUsers.length) {
+        return res.status(400).json({
+          message: `Capacity cannot be reduced below current registrations (${currentEvent.registeredUsers.length})`,
+        });
+      }
+    }
+
+    const updatedEvent = await Event.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
       runValidators: true,
     });
 
-    if (!event) {
-      return res.status(404).json({ message: "Event not found" });
-    }
-
-    res.json(event);
+    res.json(updatedEvent);
   } catch (error) {
     res.status(400).json({ message: error.message || "Failed to update event" });
   }
@@ -102,7 +192,7 @@ export const updateEvent = async (req, res) => {
 export const deleteEvent = async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ message: "Invalid event ID" });
+      return res.status(400).json({ message: "Invalid event ID format" });
     }
 
     const event = await Event.findByIdAndDelete(req.params.id);
@@ -110,11 +200,12 @@ export const deleteEvent = async (req, res) => {
       return res.status(404).json({ message: "Event not found" });
     }
 
-    res.json({ message: "Event deleted successfully" });
+    res.json({ message: "Event deleted successfully", id: req.params.id });
   } catch (error) {
     res.status(500).json({ message: "Failed to delete event", error: error.message });
   }
 };
+
 
 // REGISTER for an event (User role)
 export const registerForEvent = async (req, res) => {
