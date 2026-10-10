@@ -116,11 +116,11 @@ export const deleteEvent = async (req, res) => {
   }
 };
 
-// REGISTER for an event (User role)
+// REGISTER for an event (User role with atomic capacity check)
 export const registerForEvent = async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ message: "Invalid event ID" });
+      return res.status(400).json({ message: "Invalid event ID format" });
     }
 
     const event = await Event.findById(req.params.id);
@@ -129,6 +129,13 @@ export const registerForEvent = async (req, res) => {
     }
 
     const userId = req.user._id;
+
+    // Check if event has already passed
+    if (new Date(event.date) < new Date()) {
+      return res.status(400).json({
+        message: "Registration is closed. This event has already taken place.",
+      });
+    }
 
     // Check if already registered
     const isAlreadyRegistered = event.registeredUsers.some(
@@ -139,28 +146,57 @@ export const registerForEvent = async (req, res) => {
       return res.status(400).json({ message: "You are already registered for this event." });
     }
 
-    // Check capacity
+    // Check current capacity before atomic write
     if (event.registeredUsers.length >= event.capacity) {
       return res.status(400).json({ message: "Event is fully booked! No seats available." });
     }
 
-    event.registeredUsers.push(userId);
-    await event.save();
+    // Atomic update to avoid race conditions with concurrent registrations
+    const updatedEvent = await Event.findOneAndUpdate(
+      {
+        _id: req.params.id,
+        registeredUsers: { $ne: userId },
+        $expr: { $lt: [{ $size: "$registeredUsers" }, "$capacity"] },
+      },
+      {
+        $push: { registeredUsers: userId },
+      },
+      { new: true }
+    ).populate("registeredUsers", "name email");
+
+    if (!updatedEvent) {
+      // Re-fetch to give precise error
+      const freshEvent = await Event.findById(req.params.id);
+      if (freshEvent && freshEvent.registeredUsers.length >= freshEvent.capacity) {
+        return res.status(400).json({ message: "Event is fully booked! No seats available." });
+      }
+      return res.status(400).json({ message: "Unable to complete registration. Please try again." });
+    }
+
+    // Generate ticket reference ID
+    const ticketId = `EVT-${event._id.toString().slice(-4).toUpperCase()}-${userId
+      .toString()
+      .slice(-4)
+      .toUpperCase()}-${Date.now().toString(36).toUpperCase()}`;
+
+    const seatsLeft = Math.max(0, updatedEvent.capacity - updatedEvent.registeredUsers.length);
 
     res.json({
       message: "Successfully registered for the event!",
-      event,
+      ticketId,
+      seatsLeft,
+      event: updatedEvent,
     });
   } catch (error) {
     res.status(500).json({ message: "Registration failed", error: error.message });
   }
 };
 
-// CANCEL registration
+// CANCEL registration (User role with atomic update)
 export const cancelRegistration = async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ message: "Invalid event ID" });
+      return res.status(400).json({ message: "Invalid event ID format" });
     }
 
     const event = await Event.findById(req.params.id);
@@ -169,12 +205,32 @@ export const cancelRegistration = async (req, res) => {
     }
 
     const userId = req.user._id;
-    event.registeredUsers = event.registeredUsers.filter(
-      (id) => id.toString() !== userId.toString()
+
+    // Verify user was registered
+    const wasRegistered = event.registeredUsers.some(
+      (id) => id.toString() === userId.toString()
     );
 
-    await event.save();
-    res.json({ message: "Registration cancelled successfully", event });
+    if (!wasRegistered) {
+      return res.status(400).json({
+        message: "You are not currently registered for this event.",
+      });
+    }
+
+    // Atomic removal of user from registered list
+    const updatedEvent = await Event.findByIdAndUpdate(
+      req.params.id,
+      { $pull: { registeredUsers: userId } },
+      { new: true }
+    ).populate("registeredUsers", "name email");
+
+    const seatsLeft = Math.max(0, updatedEvent.capacity - updatedEvent.registeredUsers.length);
+
+    res.json({
+      message: "Registration cancelled successfully",
+      seatsLeft,
+      event: updatedEvent,
+    });
   } catch (error) {
     res.status(500).json({ message: "Failed to cancel registration", error: error.message });
   }
@@ -184,9 +240,78 @@ export const cancelRegistration = async (req, res) => {
 export const getMyRegistrations = async (req, res) => {
   try {
     const userId = req.user._id;
-    const events = await Event.find({ registeredUsers: userId }).sort({ date: 1 });
+    const events = await Event.find({ registeredUsers: userId })
+      .populate("registeredUsers", "name email")
+      .sort({ date: 1 });
+
     res.json(events);
   } catch (error) {
     res.status(500).json({ message: "Failed to fetch registrations", error: error.message });
   }
 };
+
+// GET registration status for the current logged-in user
+export const getRegistrationStatus = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const event = await Event.findById(req.params.id);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    const userId = req.user._id;
+    const isRegistered = event.registeredUsers.some(
+      (id) => id.toString() === userId.toString()
+    );
+    const registeredCount = event.registeredUsers.length;
+    const seatsLeft = Math.max(0, event.capacity - registeredCount);
+    const isSoldOut = registeredCount >= event.capacity;
+    const isPast = new Date(event.date) < new Date();
+
+    res.json({
+      eventId: event._id,
+      isRegistered,
+      registeredCount,
+      capacity: event.capacity,
+      seatsLeft,
+      isSoldOut,
+      isRegistrationOpen: !isSoldOut && !isPast,
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch registration status", error: error.message });
+  }
+};
+
+// GET attendee list for an event (Admin / Organizer)
+export const getEventAttendees = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const event = await Event.findById(req.params.id).populate(
+      "registeredUsers",
+      "name email createdAt"
+    );
+
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    res.json({
+      eventId: event._id,
+      title: event.title,
+      date: event.date,
+      capacity: event.capacity,
+      registeredCount: event.registeredUsers.length,
+      seatsLeft: Math.max(0, event.capacity - event.registeredUsers.length),
+      attendees: event.registeredUsers,
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch attendees", error: error.message });
+  }
+};
+

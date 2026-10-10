@@ -8,6 +8,8 @@ import {
   registerForEvent,
   cancelRegistration,
   getMyRegistrations,
+  getRegistrationStatus,
+  getEventAttendees,
 } from "../controllers/eventController.js";
 import { authenticateUser, requireAdmin } from "../middleware/auth.js";
 
@@ -26,7 +28,9 @@ router.post("/", authenticateUser, requireAdmin, createEvent);
 router.put("/:id", authenticateUser, requireAdmin, updateEvent);
 router.delete("/:id", authenticateUser, requireAdmin, deleteEvent);
 
-// User event registration actions
+// User event registration actions & attendee inspection
+router.get("/:id/registration-status", authenticateUser, getRegistrationStatus);
+router.get("/:id/attendees", authenticateUser, requireAdmin, getEventAttendees);
 router.post("/:id/register", authenticateUser, registerForEvent);
 router.delete("/:id/register", authenticateUser, cancelRegistration);
 
